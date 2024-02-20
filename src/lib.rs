@@ -207,6 +207,14 @@ impl Heap {
         self.used -= self.holes.deallocate(ptr, layout).size();
     }
 
+    /// Shrink
+    pub unsafe fn shrink(&mut self, ptr: NonNull<u8>, old_size: usize, new_size: usize) {
+        let new_hole_size = old_size - new_size;
+        self.used -= new_hole_size;
+
+        ptr.add(new_hole_size)
+    }
+
     /// Returns the bottom address of the heap.
     ///
     /// The bottom pointer is automatically aligned, so the returned pointer

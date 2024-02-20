@@ -8,7 +8,7 @@ use crate::{align_down_size, align_up_size};
 
 use super::align_up;
 
-/// A sorted list of holes. It uses the the holes itself to store its nodes.
+/// A sorted list of holes. It uses the holes itself to store its nodes.
 pub struct HoleList {
     pub(crate) first: Hole, // dummy
     pub(crate) bottom: *mut u8,
@@ -424,6 +424,10 @@ impl HoleList {
         aligned_layout
     }
 
+    pub unsafe fn shrink(&mut self, ptr: NonNull<u8>, old_size: usize, new_size: usize) {
+        self.size -= old_size - new_size;
+    }
+
     /// Returns the minimal allocation size. Smaller allocations or deallocations are not allowed.
     pub fn min_size() -> usize {
         size_of::<usize>() * 2
@@ -629,6 +633,60 @@ impl Cursor {
 /// Frees the allocation given by `(addr, size)`. It starts at the given hole and walks the list to
 /// find the correct place (the list is sorted by address).
 fn deallocate(list: &mut HoleList, addr: *mut u8, size: usize) {
+    // Start off by just making this allocation a hole where it stands.
+    // We'll attempt to merge it with other nodes once we figure out where
+    // it should live
+    let hole = unsafe { make_hole(addr, size) };
+
+    // Now, try to get a cursor to the list - this only works if we have at least
+    // one non-"dummy" hole in the list
+    let cursor = if let Some(cursor) = list.cursor() {
+        cursor
+    } else {
+        // Oh hey, there are no "real" holes at all. That means this just
+        // becomes the only "real" hole! Check if this is touching the end
+        // or the beginning of the allocation range
+        let hole = check_merge_bottom(hole, list.bottom);
+        check_merge_top(hole, list.top);
+        list.first.next = Some(hole);
+        return;
+    };
+
+    // First, check if we can just insert this node at the top of the list. If the
+    // insertion succeeded, then our cursor now points to the NEW node, behind the
+    // previous location the cursor was pointing to.
+    //
+    // Otherwise, our cursor will point at the current non-"dummy" head of the list
+    let (cursor, n) = match cursor.try_insert_back(hole, list.bottom) {
+        Ok(cursor) => {
+            // Yup! It lives at the front of the list. Hooray! Attempt to merge
+            // it with just ONE next node, since it is at the front of the list
+            (cursor, 1)
+        }
+        Err(mut cursor) => {
+            // Nope. It lives somewhere else. Advance the list until we find its home
+            while let Err(()) = cursor.try_insert_after(hole) {
+                cursor = cursor
+                    .next()
+                    .expect("Reached end of holes without finding deallocation hole!");
+            }
+            // Great! We found a home for it, our cursor is now JUST BEFORE the new
+            // node we inserted, so we need to try to merge up to twice: One to combine
+            // the current node to the new node, then once more to combine the new node
+            // with the node after that.
+            (cursor, 2)
+        }
+    };
+
+    // We now need to merge up to two times to combine the current node with the next
+    // two nodes.
+    cursor.try_merge_next_n(n);
+}
+
+/// Frees the allocation given by `(addr, size)`. It starts at the given hole and walks the list to
+/// find the correct place (the list is sorted by address).
+fn shrink(list: &mut HoleList, addr: *mut u8, size: usize) {
+    // first update size
     // Start off by just making this allocation a hole where it stands.
     // We'll attempt to merge it with other nodes once we figure out where
     // it should live
